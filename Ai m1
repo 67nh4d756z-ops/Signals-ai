@@ -1,0 +1,319 @@
+Screenshot-first Quotex AI Signal Research Dashboard.
+
+Install:
+    pip install streamlit pandas numpy scikit-learn plotly pillow
+Run:
+    streamlit run quotex_screenshot_signal_dashboard.py
+
+Important:
+- Screenshot interpretation is not automated OCR and does not create trustworthy OHLC data.
+- Screenshot-only mode records chart observations and outcomes; it does NOT invent probabilities.
+- A probability model is available only in historical CSV mode, where candle values are supplied.
+- No connection to Quotex and no automatic trading.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+import math
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, brier_score_loss, log_loss
+from sklearn.pipeline import Pipeline
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="Quotex Screenshot Signal Lab", page_icon="ð", layout="wide")
+st.title("ð Quotex Screenshot Signal Lab")
+st.caption("Screenshot review + signal journal + optional historical model validation")
+st.warning(
+    "Educational research only. No guaranteed accuracy, no automated trading, and no Quotex account connection. "
+    "A screenshot alone cannot support a calibrated win probability."
+)
+
+tab_shot, tab_data, tab_journal = st.tabs(
+    ["ð· Screenshot analysis", "ð§ª Historical model test", "ðï¸ Signal journal"]
+)
+
+FEATURES = [
+    "ret_1", "ret_2", "ret_3", "ret_6", "ret_12",
+    "ema_gap_9_21", "ema_gap_21_50", "rsi_14", "macd_norm",
+    "range_norm", "body_norm", "upper_wick_norm", "lower_wick_norm",
+    "volatility_12", "volume_change", "close_location"
+]
+REQUIRED = {"open", "high", "low", "close"}
+
+
+def normalize_csv(file):
+    df = pd.read_csv(file)
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    aliases = {"date": "timestamp", "datetime": "timestamp", "time": "timestamp",
+               "tick_volume": "volume", "vol": "volume"}
+    df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
+    missing = REQUIRED - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {', '.join(sorted(missing))}")
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        df = df.sort_values("timestamp")
+    else:
+        df["timestamp"] = np.arange(len(df))
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    df = df.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+    if len(df) < 150:
+        raise ValueError("Upload at least 150 candles; several thousand are preferable.")
+    return df
+
+
+def make_features(df, horizon):
+    x = df.copy()
+    close, high, low, opn = x["close"], x["high"], x["low"], x["open"]
+    for n in [1, 2, 3, 6, 12]:
+        x[f"ret_{n}"] = close.pct_change(n)
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    x["ema_gap_9_21"] = (ema9 - ema21) / close.replace(0, np.nan)
+    x["ema_gap_21_50"] = (ema21 - ema50) / close.replace(0, np.nan)
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    x["rsi_14"] = 100 - (100 / (1 + rs))
+    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    x["macd_norm"] = macd / close.replace(0, np.nan)
+    candle_range = (high - low).replace(0, np.nan)
+    x["range_norm"] = (high - low) / close.replace(0, np.nan)
+    x["body_norm"] = (close - opn) / close.replace(0, np.nan)
+    x["upper_wick_norm"] = (high - np.maximum(opn, close)) / close.replace(0, np.nan)
+    x["lower_wick_norm"] = (np.minimum(opn, close) - low) / close.replace(0, np.nan)
+    x["volatility_12"] = close.pct_change().rolling(12).std()
+    x["volume_change"] = x["volume"].pct_change().replace([np.inf, -np.inf], np.nan)
+    x["close_location"] = ((close - low) / candle_range).clip(0, 1)
+    future = close.shift(-horizon)
+    x["target"] = (future > close).astype(float)
+    x.loc[future.isna(), "target"] = np.nan
+    x[FEATURES] = x[FEATURES].replace([np.inf, -np.inf], np.nan)
+    return x
+
+
+def new_model():
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", HistGradientBoostingClassifier(
+            max_iter=150, learning_rate=0.06, max_leaf_nodes=15,
+            l2_regularization=2.0, random_state=42
+        ))
+    ])
+
+
+def add_journal_row(row):
+    # Session state is a convenience, not permanent storage. Download the CSV to keep it.
+    st.session_state.setdefault("journal", [])
+    st.session_state["journal"].append(row)
+
+
+with tab_shot:
+    st.subheader("1. Upload your Quotex chart screenshot")
+    st.write("For best review, show the asset name, 5-minute timeframe, candles, and any indicators without cropping out the price scale.")
+    screenshot = st.file_uploader(
+        "Choose a screenshot (PNG/JPG)", type=["png", "jpg", "jpeg"], key="screenshot_upload"
+    )
+    if screenshot:
+        try:
+            image = Image.open(screenshot)
+            st.image(image, caption="Uploaded chart screenshot", use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not open image: {exc}")
+
+    with st.form("screenshot_observation_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            asset = st.text_input("Asset / pair", placeholder="e.g. EUR/USD or BTC/USD")
+            timeframe = st.selectbox("Chart timeframe", ["5 minutes", "1 minute", "Other"])
+            expiry = st.selectbox("Hypothetical forecast horizon", ["Next 5-minute close", "Next 10 minutes", "Next 15 minutes"])
+            trend = st.selectbox("Visible trend", ["Unclear / range", "Uptrend", "Downtrend"])
+            structure = st.selectbox("Price structure", [
+                "Unclear", "Higher highs / higher lows", "Lower highs / lower lows",
+                "Near support", "Near resistance", "Possible breakout", "Possible rejection"
+            ])
+        with col2:
+            candle_momentum = st.selectbox("Recent candle momentum", [
+                "Mixed / unclear", "Mostly bullish", "Mostly bearish", "Large volatile candles"
+            ])
+            rsi_seen = st.selectbox("RSI, if shown", [
+                "Not visible", "Below 30", "30â45", "45â55", "55â70", "Above 70"
+            ])
+            screenshot_quality = st.selectbox("Screenshot readability", ["Good", "Fair", "Poor"])
+            context_notes = st.text_area("Notes (optional)", placeholder="e.g. price near resistance; choppy candles")
+        submitted = st.form_submit_button("Record chart observation")
+    if submitted:
+        if not screenshot:
+            st.error("Upload a screenshot first.")
+        elif not asset.strip():
+            st.error("Enter the asset or pair.")
+        else:
+            row = {
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                "asset": asset.strip(),
+                "timeframe": timeframe,
+                "forecast_horizon": expiry,
+                "trend": trend,
+                "structure": structure,
+                "candle_momentum": candle_momentum,
+                "rsi_seen": rsi_seen,
+                "screenshot_quality": screenshot_quality,
+                "notes": context_notes.strip(),
+                "signal": "NOT ASSIGNED",
+                "estimated_probability": "",
+                "outcome_after_horizon": "PENDING",
+                "result": "PENDING"
+            }
+            add_journal_row(row)
+            st.success("Observation recorded in this session's journal. Download the journal CSV to preserve it.")
+            st.info("No CALL/PUT probability was generated: visual labels from one screenshot are not a calibrated model.")
+    st.markdown("### What can be concluded from a screenshot?")
+    st.markdown(
+        "- Visible trend, candle shapes, approximate support/resistance, and displayed indicators can be discussed.\n"
+        "- Exact OHLC values may be unreadable or distorted by chart scaling.\n"
+        "- A screenshot does not provide the full chronological history needed to validate a predictive model.\n"
+        "- Treat visual chart interpretation as qualitative until enough observations and future outcomes are logged."
+    )
+
+with tab_data:
+    st.subheader("2. Optional: validate a model using historical candles")
+    st.write("Upload OHLCV CSV data to test a machine-learning model. This is separate from screenshot-only review.")
+    uploads = st.file_uploader(
+        "Upload one or more historical 5-minute CSV files",
+        type=["csv"], accept_multiple_files=True, key="historical_uploads"
+    )
+    if uploads:
+        selected_name = st.selectbox("Choose asset dataset", [f.name for f in uploads])
+        selected_file = next(f for f in uploads if f.name == selected_name)
+        try:
+            df = normalize_csv(selected_file)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Candles", f"{len(df):,}")
+            c2.metric("First row", str(df["timestamp"].iloc[0]))
+            c3.metric("Last row", str(df["timestamp"].iloc[-1]))
+            horizon = st.selectbox("Prediction horizon in candles", [1, 2, 3], index=0)
+            test_fraction = st.slider("Chronological test fraction", 0.15, 0.40, 0.25, 0.05)
+            threshold = st.slider("Signal threshold", 0.50, 0.90, 0.65, 0.01)
+            payout_pct = st.slider("Net winning payout (%)", 40, 95, 80, 1)
+            stake = st.number_input("Hypothetical stake per signal (â¹)", min_value=1.0, value=100.0, step=50.0)
+            if st.button("Run out-of-sample test"):
+                data = make_features(df, horizon).dropna(subset=["target"]).copy()
+                data["target"] = data["target"].astype(int)
+                data = data.dropna(subset=["ret_1", "ret_2", "ret_3", "ret_6", "ret_12"])
+                split = int(len(data) * (1 - test_fraction))
+                train, test = data.iloc[:split], data.iloc[split:]
+                if len(train) < 100 or len(test) < 30 or train["target"].nunique() < 2:
+                    st.error("Not enough usable data or only one training class. Upload more history.")
+                else:
+                    model = new_model()
+                    model.fit(train[FEATURES], train["target"])
+                    classes = list(model.named_steps["model"].classes_)
+                    prob_up = model.predict_proba(test[FEATURES])[:, classes.index(1)]
+                    pred = (prob_up >= 0.5).astype(int)
+                    threshold_value = threshold
+                    signals = np.where(prob_up >= threshold_value, "CALL",
+                               np.where(prob_up <= 1 - threshold_value, "PUT", "NO TRADE"))
+                    active_mask = signals != "NO TRADE"
+                    active_idx = np.flatnonzero(active_mask)
+                    wins = []
+                    pnl = []
+                    for i in active_idx:
+                        actual_up = int(test["target"].iloc[i]) == 1
+                        won = actual_up if signals[i] == "CALL" else not actual_up
+                        wins.append(won)
+                        pnl.append((payout_pct / 100 * stake) if won else -stake)
+                    win_rate = float(np.mean(wins)) if wins else float("nan")
+                    breakeven = 1 / (1 + payout_pct / 100)
+                    net_pnl = float(np.sum(pnl)) if pnl else 0.0
+                    roi = net_pnl / (len(pnl) * stake) if pnl else float("nan")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Test candles", f"{len(test):,}")
+                    m2.metric("Directional accuracy", f"{accuracy_score(test['target'], pred):.1%}")
+                    m3.metric("Balanced accuracy", f"{balanced_accuracy_score(test['target'], pred):.1%}")
+                    m4.metric("Signal coverage", f"{np.mean(active_mask):.1%}")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Signals", str(len(active_idx)))
+                    m2.metric("Signal win rate", "â" if math.isnan(win_rate) else f"{win_rate:.1%}")
+                    m3.metric("Break-even win rate", f"{breakeven:.1%}")
+                    m4.metric("Hypothetical net P/L", f"â¹{net_pnl:,.2f}")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Hypothetical ROI", "â" if math.isnan(roi) else f"{roi:.1%}")
+                    m2.metric("Brier score (lower is better)", f"{brier_score_loss(test['target'], prob_up):.3f}")
+                    m3.metric("Log loss (lower is better)", f"{log_loss(test['target'], np.clip(prob_up, 1e-6, 1-1e-6), labels=[0,1]):.3f}")
+                    st.caption(f"At {payout_pct}% net payout, break-even win rate is {breakeven:.1%}, before execution differences.")
+                    st.warning("This is one chronological holdout, not proof of a durable edge. Do not tune settings against this test set and then report it as independent.")
+                    out = test[["timestamp", "close", "target"]].copy()
+                    out["probability_up"] = prob_up
+                    out["probability_down"] = 1 - prob_up
+                    out["signal"] = signals
+                    out["correct_direction"] = (pred == test["target"].to_numpy())
+                    st.dataframe(out.tail(300), use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "Download out-of-sample predictions",
+                        out.to_csv(index=False).encode("utf-8"),
+                        file_name="out_of_sample_predictions.csv",
+                        mime="text/csv"
+                    )
+                    st.subheader("Test candles")
+                    fig = go.Figure(data=[go.Candlestick(
+                        x=test["timestamp"], open=test["open"], high=test["high"],
+                        low=test["low"], close=test["close"], name="Test candles"
+                    )])
+                    sig_df = out[ out["signal"] != "NO TRADE" ]
+                    calls = sig_df[sig_df["signal"] == "CALL"]
+                    puts = sig_df[sig_df["signal"] == "PUT"]
+                    if len(calls):
+                        fig.add_trace(go.Scatter(x=calls["timestamp"], y=calls["close"], mode="markers",
+                                                 marker_symbol="triangle-up", marker_size=9, name="CALL"))
+                    if len(puts):
+                        fig.add_trace(go.Scatter(x=puts["timestamp"], y=puts["close"], mode="markers",
+                                                 marker_symbol="triangle-down", marker_size=9, name="PUT"))
+                    fig.update_layout(height=480, xaxis_rangeslider_visible=False)
+                    st.plotly_chart(fig, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not process CSV: {exc}")
+    else:
+        st.info("Screenshot review can be used without CSV. For model probabilities and rigorous testing, historical candle data is required.")
+
+with tab_journal:
+    st.subheader("3. Screenshot observation journal")
+    st.write("Rows added in the screenshot tab stay in the current app session. Download the CSV before closing or refreshing.")
+    st.session_state.setdefault("journal", [])
+    if st.session_state["journal"]:
+        journal_df = pd.DataFrame(st.session_state["journal"])
+        st.dataframe(journal_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download screenshot journal CSV",
+            journal_df.to_csv(index=False).encode("utf-8"),
+            file_name="screenshot_signal_journal.csv",
+            mime="text/csv"
+        )
+        st.markdown("**To complete the validation loop:** after the selected forecast horizon, record the actual direction and settlement result in your own journal. Keep each prediction timestamped and never overwrite a wrong signal.")
+    else:
+        st.info("No screenshot observations recorded in this session yet.")
+
+with st.expander("Validation checklist before trusting any model"):
+    st.markdown("""
+1. Use data from the same feed, asset, timezone, and candle duration as the chart you trade.
+2. Split chronologically: training first, validation next, final test last. Never shuffle time-series rows.
+3. Keep the final test untouched while choosing features, thresholds, or model settings.
+4. Repeat walk-forward tests across multiple periods and assets.
+5. Check calibration (Brier score, log loss, and reliability by probability bin); a 70% estimate should win about 70% of comparable outcomes over enough samples if calibrated.
+6. Compare signal win rate with the payout break-even rate and include ties, missed entries, delays, and broker-specific settlement rules.
+7. Public-market data may not match Quotex OTC candles. Do not transfer a backtest result to a different feed without testing it.
+8. Screenshot-only annotations do not generate statistical probability estimates by themselves.
+""")
